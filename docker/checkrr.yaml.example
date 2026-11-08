@@ -1,0 +1,53 @@
+lang: en-us
+
+checkrr:
+  checkpath:
+    - /media/movies
+    - /media/tv
+  database: /data/checkrr.db
+  debug: false
+  # Empty disables automatic library scans. Start one from the Checkrr UI.
+  cron: ""
+  ffprobe: true
+  ffmpeg-full: true
+  ignorehidden: true
+  ignoreexts:
+    - .txt
+    - .nfo
+    - .nzb
+    - .url
+    - .bak
+    - .tmp
+
+logs:
+  stdout:
+    out: stdout
+    formatter: default
+
+arr:
+  radarr:
+    process: true
+    service: radarr
+    address: radarr
+    apikey: "REPLACE_WITH_RADARR_API_KEY"
+    baseurl: /radarr/
+    port: 7878
+    ssl: false
+    mappings:
+      /media/: /media/
+
+  sonarr:
+    process: true
+    service: sonarr
+    address: sonarr
+    apikey: "REPLACE_WITH_SONARR_API_KEY"
+    baseurl: /sonarr/
+    port: 8989
+    ssl: false
+    mappings:
+      /media/: /media/
+
+webserver:
+  port: 8585
+  baseurl: /
+  tls: false

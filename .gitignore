@@ -10,6 +10,8 @@ badfiles.csv
 checkrr.log
 webserver/build
 webserver/node_modules
+mediacheck/__pycache__/
+*.py[cod]
 .devenv/
 .direnv/
 .idea/

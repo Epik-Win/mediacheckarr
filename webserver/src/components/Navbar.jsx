@@ -28,8 +28,7 @@ export default function ResponsiveAppBar() {
       setrunning(data.running);
     });
     http.get('./api/schedule').then((data) => {
-      const nextRun = data ? parseJSON(data) : new Date();
-      setschedule(formatDistanceToNow(nextRun, { addSuffix: true }));
+      setschedule(data ? formatDistanceToNow(parseJSON(data), { addSuffix: true }) : null);
     });
   }
 
@@ -84,7 +83,7 @@ export default function ResponsiveAppBar() {
                 textDecoration: 'none',
               }}
             >
-              {running ? 'Running' : `Waiting for next run ${schedule && `(${schedule})`}`}
+              {running ? 'Running' : schedule ? `Waiting for next run (${schedule})` : 'Manual runs only'}
             </Typography>
           </Box>
           {timeDiff && <Box sx={{ flexGrow: 0 }}>
