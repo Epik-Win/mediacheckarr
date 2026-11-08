@@ -1,0 +1,46 @@
+host_media_root: /media/
+arr_media_root: /media/
+library_dirs:
+  - /media/movies
+  - /media/tv
+
+hook_queues:
+  - /queues/sonarr
+  - /queues/radarr
+
+quarantine_dir: /quarantine
+quarantine_days: 14
+backup_days: 14
+settle_minutes: 10
+
+policy:
+  reacquire_unreadable: true
+  identity_mismatch: review
+
+identity:
+  enabled: false
+  on_import: true
+  use_audio: true
+  transcription:
+    url: http://litellm:8090/v1/audio/transcriptions
+    model: whisper-1
+    key_file: /run/secrets/litellm-keys.env
+    key_name: WHISPER_API_KEY
+  audio_sample_minutes: 30
+  minimum_transcript_words: 50
+  minimum_reference_words: 50
+  match_threshold_pct: 15
+  max_minutes_per_run: 10
+  bazarr:
+    url: http://bazarr:6767
+    config_file: /run/secrets/bazarr-config.yaml
+    validation_profile: Identity Validation English
+    reference_provider: gestdown
+    minimum_candidate_score: 70
+    max_episode_reference_tries: 6
+    movie_validation_profile: Identity Validation English
+    movie_reference_providers: [subtitlecat, yifysubtitles]
+    minimum_movie_candidate_score: 70
+  movie_runtime_tolerance_pct: 25
+
+debuggarr_url: http://debuggarr:8095/api/notify

@@ -1,0 +1,44 @@
+services:
+  mediacheckarr:
+    build: .
+    image: epik-win/mediacheckarr:latest
+    container_name: mediacheckarr
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      CHECKRR_CONFIG: /config/checkrr.yaml
+      MEDIACHECK_CONFIG_DIR: /config
+      MEDIACHECK_DATA_DIR: /data
+      DEBUGGARR_URL: http://debuggarr:8095/api/notify
+      DEBUGGARR_API_SECRET_FILE: /run/secrets/debuggarr.env
+      MEDIACHECK_POLL_SECONDS: "5"
+    volumes:
+      - "${CHECKRR_CONFIG_DIR:?Set CHECKRR_CONFIG_DIR}/checkrr.yaml:/config/checkrr.yaml:ro"
+      - "${CHECKRR_CONFIG_DIR:?Set CHECKRR_CONFIG_DIR}/mediacheck.yaml:/config/mediacheck.yaml:ro"
+      - "${MEDIACHECK_DATA_DIR:?Set MEDIACHECK_DATA_DIR}:/data"
+      - "${MEDIA_ROOT:?Set MEDIA_ROOT}:/media"
+      - "${QUARANTINE_DIR:?Set QUARANTINE_DIR}:/quarantine"
+      - "${SONARR_QUEUE_DIR:?Set SONARR_QUEUE_DIR}:/queues/sonarr"
+      - "${RADARR_QUEUE_DIR:?Set RADARR_QUEUE_DIR}:/queues/radarr"
+      - "${BAZARR_CONFIG_FILE:?Set BAZARR_CONFIG_FILE}:/run/secrets/bazarr-config.yaml:ro"
+      - "${LITELLM_KEYS_FILE:?Set LITELLM_KEYS_FILE}:/run/secrets/litellm-keys.env:ro"
+      - "${DEBUGGARR_ENV_FILE:?Set DEBUGGARR_ENV_FILE}:/run/secrets/debuggarr.env:ro"
+    ports:
+      - "127.0.0.1:${CHECKRR_WEB_PORT:-8585}:8585"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8585/api/stats/current', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - media
+
+networks:
+  media:
+    external: true
+    name: "${MEDIA_DOCKER_NETWORK:-nginx_default}"

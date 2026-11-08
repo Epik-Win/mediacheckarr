@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/BurntSushi/toml"
@@ -321,22 +322,33 @@ func main() {
 		}
 		c.Run()
 	} else {
-		// Setup Cron runner.
 		var id cron.EntryID
-		scheduler = cron.New()
-		id, _ = scheduler.AddJob(k.String("checkrr.cron"), &c)
-		web.AddScheduler(scheduler, id)
+		schedule := strings.TrimSpace(k.String("checkrr.cron"))
+		if schedule != "" {
+			scheduler = cron.New()
+			var err error
+			id, err = scheduler.AddJob(schedule, &c)
+			if err != nil {
+				logger.Fatalf("invalid checkrr.cron value %q: %v", schedule, err)
+			}
+			scheduler.Start()
+		} else {
+			scheduler = nil
+			logger.Info("Scheduled scans are disabled; use the web UI or API to run Checkrr manually.")
+		}
 		if runWeb {
+			web.AddScheduler(scheduler, id)
 			go web.Run()
 		}
-		scheduler.Start()
-		message := c.Localizer.MustLocalize(&i18n.LocalizeConfig{
-			MessageID: "ScheduleNextRun",
-			TemplateData: map[string]interface{}{
-				"Time": scheduler.Entry(id).Next.String(),
-			},
-		})
-		logger.Info(message)
+		if scheduler != nil {
+			message := c.Localizer.MustLocalize(&i18n.LocalizeConfig{
+				MessageID: "ScheduleNextRun",
+				TemplateData: map[string]interface{}{
+					"Time": scheduler.Entry(id).Next.String(),
+				},
+			})
+			logger.Info(message)
+		}
 
 		// Blocks forever waiting on Signals from the system or user
 		for {
@@ -347,9 +359,14 @@ func main() {
 					c.Stats.Stop()
 					c.Stats.Render()
 				}
-				scheduler.Stop()
+				if scheduler != nil {
+					scheduler.Stop()
+				}
 				os.Exit(0)
 			case <-rendertime:
+				if scheduler == nil {
+					continue
+				}
 				// Output next run time
 				message := c.Localizer.MustLocalize(&i18n.LocalizeConfig{
 					MessageID: "ScheduleNextRun",
@@ -361,21 +378,39 @@ func main() {
 			case <-hup:
 				// Reload config and reinit scheduler on SIGHUP
 				initConfig()
-				scheduler.Remove(id)
-				scheduler.Stop()
-				id, _ = scheduler.AddJob(k.String("checkrr.cron"), &c)
-				scheduler.Start()
+				if scheduler != nil {
+					scheduler.Stop()
+				}
+				schedule := strings.TrimSpace(k.String("checkrr.cron"))
+				scheduler = nil
+				id = 0
+				if schedule != "" {
+					scheduler = cron.New()
+					var err error
+					id, err = scheduler.AddJob(schedule, &c)
+					if err != nil {
+						logger.Fatalf("invalid checkrr.cron value %q: %v", schedule, err)
+					}
+					scheduler.Start()
+				}
+				if runWeb {
+					web.AddScheduler(scheduler, id)
+				}
 				message := c.Localizer.MustLocalize(&i18n.LocalizeConfig{
 					MessageID: "ConfigReload",
 				})
 				logger.Info(message)
-				message = c.Localizer.MustLocalize(&i18n.LocalizeConfig{
-					MessageID: "ScheduleNextRun",
-					TemplateData: map[string]interface{}{
-						"Time": scheduler.Entry(id).Next.String(),
-					},
-				})
-				logger.Info(message)
+				if scheduler == nil {
+					logger.Info("Scheduled scans are disabled; use the web UI or API to run Checkrr manually.")
+				} else {
+					message = c.Localizer.MustLocalize(&i18n.LocalizeConfig{
+						MessageID: "ScheduleNextRun",
+						TemplateData: map[string]interface{}{
+							"Time": scheduler.Entry(id).Next.String(),
+						},
+					})
+					logger.Info(message)
+				}
 			}
 		}
 	}
