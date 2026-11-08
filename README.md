@@ -5,16 +5,19 @@ This fork runs both workers in one Docker container. Mediacheck only processes
 Sonarr/Radarr import and upgrade events; full Checkrr scans are manual by
 default. See [the combined Docker setup](docker/README.md) for deployment.
 
-[![](https://dcbadge.vercel.app/api/server/dkTfNKbEhJ?style=flat)](https://discord.gg/dkTfNKbEhJ) ![Docker Pulls](https://img.shields.io/docker/pulls/epik-win/mediacheckarr) ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/Epik-Win/mediacheckarr/total) ![GitHub License](https://img.shields.io/github/license/Epik-Win/mediacheckarr) [![GitHub Release](https://img.shields.io/github/v/release/Epik-Win/mediacheckarr)](https://github.com/Epik-Win/mediacheckarr/releases) ![GitHub Release Date](https://img.shields.io/github/release-date/Epik-Win/mediacheckarr)
+[![Docker Pulls](https://img.shields.io/docker/pulls/epik-win/mediacheckarr)](https://hub.docker.com/r/epik-win/mediacheckarr) ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/Epik-Win/mediacheckarr/total) ![GitHub License](https://img.shields.io/github/license/Epik-Win/mediacheckarr) [![GitHub Release](https://img.shields.io/github/v/release/Epik-Win/mediacheckarr)](https://github.com/Epik-Win/mediacheckarr/releases) ![GitHub Release Date](https://img.shields.io/github/release-date/Epik-Win/mediacheckarr)
 
 
-## Why does this exist
-I've been running a media library since 2013, migrating my library between both servers (I've had 3 so far) and filesystems (ext4 on LVM was a mistake). I've lost whole disks worth of data in the past and my library has had various problems ever since that I have never bothered to fully track down until now. 
+## Features
 
-Checkrr runs various checks (ffprobe, magic number, mimetype, and file hash on subsequent runs to drastically improve speed) on the path you specify as `checkpath` in the config. 
+Checkrr validates media files with ffprobe, container and MIME checks, and
+optional deeper ffmpeg checks. It stores successful file hashes so unchanged
+files can be checked efficiently on later runs. When configured, Checkrr can
+ask Sonarr or Radarr to replace files that fail integrity checks.
 
-* If the file passes inspection, the hash is recorded in a bbolt flatfile DB so future runs are insanely fast on large libraries. 
-* If the file fails any check checkrr will connect to sonarr and/or radarr for the file, remove it, and request a new version via the correct system (assuming they are enabled... you could just run checkrr in a no-op state by setting `sonarr.process: false` and `radarr.process: false` in the config and then egrep the output like so `checkrr check | egrep "Hash Mismatch|not a recognized file type"` for environments that do not run either of these.)
+The combined Docker image also runs mediacheck for Sonarr/Radarr import
+events. Import-triggered checks and manual full-library Checkrr scans are
+separate workflows.
 
 ## Screenshots
 ![Idle screenshot](./screenshots/Idle.png?raw=true)
@@ -33,14 +36,6 @@ Checkrr runs various checks (ffprobe, magic number, mimetype, and file hash on s
 Use the integrated Docker image and setup guide in [docker/README.md](docker/README.md).
 
 
-### debian/ubuntu
-```
-sudo wget -O /etc/apt/trusted.gpg.d/checkrr.gpg https://repo.checkrr.aetaric.ninja/checkrr.gpg
-echo "deb [signed-by=/etc/apt/trusted.gpg.d/checkrr.gpg] https://repo.checkrr.aetaric.ninja/ checkrr main" | sudo tee /etc/apt/sources.list.d/checkrr.list
-sudo apt update
-sudo apt install checkrr
-```
-
 ### Running Checkrr
 cli as a daemon:
 ``` checkrr -c /etc/checkrr.yaml ```
@@ -53,9 +48,6 @@ docker:
 
 The Checkrr web UI's **Run Now** action starts a full library scan; it is not
 scheduled unless `checkrr.cron` is configured.
-
-### unRAID using mrslaw's community applications repo
-Please note the Additional Requirements on the details screen prior to pressing install. mrslaw has all the commands you need to run there.
 
 ## Upgrading to 3.1 or newer
 checkrr > 3.1 has changed the way arr services are handled. Please review the example config and bring your config into compliance prior to running checkrr. With the 3.1 release checkrr supports having multiple of each arr service. So you could have 3 sonarr instances connected. Each arr config under `arr:` has a `service` key to tell checkrr what service type it is. This can be set to `sonarr`, `radarr`, or `lidarr`. Please note that if you are running on docker, you will likely want to setup path mappings for each service. checkrr will attempt to translate the paths that the arr services see when working with their APIs.

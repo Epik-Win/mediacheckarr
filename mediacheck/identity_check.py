@@ -45,9 +45,8 @@ from contextlib import contextmanager
 import mclib
 import yaml
 
-# Radarr/Sonarr addresses and keys come from checkrr.yaml (via mclib), the
-# same place checkrr gets them - they used to be hardcoded here, pointing at
-# the wrong URL base.
+# Resolve Radarr/Sonarr addresses and API keys from the shared Checkrr config,
+# including each service's URL base.
 _CONFIG = mclib.load_config()
 _ARR = _CONFIG["arr"]
 _IDENTITY = _CONFIG["identity"]

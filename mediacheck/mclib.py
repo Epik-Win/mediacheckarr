@@ -64,7 +64,7 @@ def log(msg, echo=False):
 
 
 DEBUGGARR_ENV = os.environ.get(
-    "DEBUGGARR_API_SECRET_FILE", "/srv/media_server/debuggarr/.env",
+    "DEBUGGARR_API_SECRET_FILE", "/run/secrets/debuggarr.env",
 )
 
 
