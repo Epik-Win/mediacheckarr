@@ -1,7 +1,11 @@
-# Checkrr
-Scan your library files for corrupt media and replace the files via sonarr and radarr
+# mediacheckarr
+Checkrr library integrity scans combined with import-triggered mediacheck compatibility and identity checks.
 
-[![](https://dcbadge.vercel.app/api/server/dkTfNKbEhJ?style=flat)](https://discord.gg/dkTfNKbEhJ) ![Docker Pulls](https://img.shields.io/docker/pulls/aetaric/checkrr) ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/aetaric/checkrr/total) ![GitHub License](https://img.shields.io/github/license/aetaric/checkrr) [![GitHub Release](https://img.shields.io/github/v/release/aetaric/checkrr)](https://github.com/aetaric/checkrr/releases) ![GitHub Release Date](https://img.shields.io/github/release-date/aetaric/checkrr)
+This fork runs both workers in one Docker container. Mediacheck only processes
+Sonarr/Radarr import and upgrade events; full Checkrr scans are manual by
+default. See [the combined Docker setup](docker/README.md) for deployment.
+
+[![](https://dcbadge.vercel.app/api/server/dkTfNKbEhJ?style=flat)](https://discord.gg/dkTfNKbEhJ) ![Docker Pulls](https://img.shields.io/docker/pulls/epik-win/mediacheckarr) ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/Epik-Win/mediacheckarr/total) ![GitHub License](https://img.shields.io/github/license/Epik-Win/mediacheckarr) [![GitHub Release](https://img.shields.io/github/v/release/Epik-Win/mediacheckarr)](https://github.com/Epik-Win/mediacheckarr/releases) ![GitHub Release Date](https://img.shields.io/github/release-date/Epik-Win/mediacheckarr)
 
 
 ## Why does this exist
@@ -21,17 +25,12 @@ Checkrr runs various checks (ffprobe, magic number, mimetype, and file hash on s
 * Install prerequisite packages via your package manager or by downloading the installer (for windows): ffmpeg
 * Make sure ffprobe is in your $PATH var. If you installed from a Linux/macOS package manager, it is. If you are on windows, you'll need to make sure you can run ffprobe from a basic command prompt/powershell.
 * Grab a release from the releases page.
-* Copy the example config from the repo: `wget https://raw.githubusercontent.com/aetaric/checkrr/main/checkrr.yaml.example -O checkrr.yaml`
-* Edit the config in your favorite editor. Make sure you remove any sections you aren't using. (If you aren't using influxdb 1 and/or 2 for example, you should remove the entire stats block from your config.)If you aren't sure what the minimal config file can look like, check https://raw.githubusercontent.com/aetaric/checkrr/main/checkrr.yaml.minimal. 
+* Copy the example config from the repo: `wget https://raw.githubusercontent.com/Epik-Win/mediacheckarr/main/checkrr.yaml.example -O checkrr.yaml`
+* Edit the config in your favorite editor. Make sure you remove any sections you aren't using. (If you aren't using influxdb 1 and/or 2 for example, you should remove the entire stats block from your config.)If you aren't sure what the minimal config file can look like, check https://raw.githubusercontent.com/Epik-Win/mediacheckarr/main/checkrr.yaml.minimal.
 * To run checkrr as a daemon, use `checkrr -c /path/to/checkrr.yaml`. If you'd like checkrr to run once and then exit (useful for running in your own cron daemon) `checkrr -c /path/to/checkrr.yaml --run-once`.
 
 ### docker
-YOU MUST CREATE THE CONFIG AND DB FILES BEFORE STARTING. checkrr will complain if these are directories. Docker doesn't know you want to mount a file unless it already exists.
-
-* creating empty db file: `touch checkrr.db`
-* creating a config file from the example: `wget https://raw.githubusercontent.com/aetaric/checkrr/main/checkrr.yaml.example -O checkrr.yaml`
-_make sure you edit the example config from the defaults. Remove any unused sections._
-While editing the example you might want to add path mappings if the path to your media differs from arr services and checkrr.
+Use the integrated Docker image and setup guide in [docker/README.md](docker/README.md).
 
 
 ### debian/ubuntu
@@ -50,25 +49,10 @@ cli as a one-off:
 ``` checkrr -c /etc/checkrr.yaml -o```
 
 docker:
-``` docker run -v /path/to/checkrr.yaml:/etc/checkrr.yaml -v /path/to/media:/media -v /path/to/checkrr.db:/checkrr.db aetaric/checkrr:latest ```
+``` docker compose -f compose.yaml up -d --build ```
 
-compose:
-```yaml
----
-version: "3"
-
-services:
-  checkrr:
-    container_name: checkrr
-    image: aetaric/checkrr:latest
-    volumes:
-      - /path/to/checkrr/config/checkrr.yaml:/etc/checkrr.yaml
-      - /path/to/checkrr/config/checkrr.db:/checkrr.db
-      - /path/to/media/to/scan:/media
-    ports:
-      - 8585:8585
-    restart: on-failure
-```
+The Checkrr web UI's **Run Now** action starts a full library scan; it is not
+scheduled unless `checkrr.cron` is configured.
 
 ### unRAID using mrslaw's community applications repo
 Please note the Additional Requirements on the details screen prior to pressing install. mrslaw has all the commands you need to run there.

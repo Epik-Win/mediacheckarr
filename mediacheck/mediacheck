@@ -1,0 +1,1000 @@
+#!/usr/bin/env python3
+"""mediacheck - one pipeline for "is this library file right, and if not,
+fix it or replace it".
+
+Every file goes through the same stages, and each finding maps to exactly
+one outcome:
+
+  stage       finding                              outcome
+  ---------   ----------------------------------   ------------------------
+  probe       ffprobe can't read the file          RE-ACQUIRE
+  fix         badly interleaved MP4 (Tuner)        FIX in place (lossless)
+              HEVC 10-bit MKV with EAC3 5.1(side) FIX in place (add AAC
+              main audio (Taken)                   track, keep everything)
+              a fix fails                          REVIEW
+  identity    mismatch or unverifiable result      REVIEW; explicit approval
+                                                   is required to keep/replace
+
+  FIX         = fix_mp4_interleave.sh / fix_mkv_audio.sh; the original is
+                kept as <name>.bak for backup_days.
+  RE-ACQUIRE  = move the file to quarantine, blocklist the release it came
+                from in Radarr/Sonarr, search for a different one.
+  REVIEW      = full evidence DM to the admin through Debuggarr +
+                `mediacheck status`; explicit accept/replace decision required.
+
+Successful outcomes are logged only. Anything that needs the admin (reviews,
+failed re-acquires or rescans, a crashed run) is sent as a private Debuggarr
+DM. Mediacheck never posts to a Discord channel.
+
+checkrr (the Docker container) can perform a manual deep integrity scan,
+and deletes + re-acquires anything corrupt itself. It has no scheduled scan.
+mediacheck keeps import checks lightweight: ffprobe reads container metadata,
+then two narrow detectors look for the known Taken audio layout and Tuner's
+MP4 subtitle interleaving issue. Only a matching file is remuxed.
+
+Commands:
+  hook               automatic: files Sonarr/Radarr just imported or upgraded
+                     (queued by arr_hook.sh)
+  service            wait for Arr import queues; never scan libraries
+  watch              every file that's new/changed since mediacheck saw it
+  scan               re-run the fix stage on every file
+  check <file>       verbose run of every stage on one file (identity check
+                     may use Whisper - slow); never re-acquires by itself
+  status             what's waiting for review, and totals
+  reacquire <file>   replace a file with a different release  [--dry-run]
+  ok <file>          dismiss a review: you've checked it, the file is right
+  restore <file>     undo a fix (or an old MKV->MP4 remux) from its backup
+"""
+import argparse
+import errno
+import fcntl
+import glob
+import io
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import wave
+from datetime import datetime
+
+import yaml
+
+import mclib
+from mclib import alert_admin, log, short
+
+DIR = mclib.DIR
+STATE_FILE = os.environ.get(
+    "MEDIACHECK_STATE", os.path.join(mclib.DATA_DIR, "mediacheck_state.json"),
+)
+LOCK_FILE = os.path.join(mclib.DATA_DIR, ".mediacheck.lock")
+VIDEO_EXTS = (".mkv", ".mp4", ".m4v", ".mov", ".avi", ".ts", ".m2ts", ".wmv")
+FIXERS = {".mkv": "fix_mkv_audio.sh", ".mp4": "fix_mp4_interleave.sh",
+          ".m4v": "fix_mp4_interleave.sh", ".mov": "fix_mp4_interleave.sh"}
+IDENTITY_EXIT = {0: "OK", 10: "MISMATCH", 20: "UNVERIFIABLE"}
+
+
+# ---------------------------------------------------------------- state --
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"files": {}, "backups": {}}
+
+
+def save_state(st):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1, sort_keys=True)
+    os.replace(tmp, STATE_FILE)
+
+
+def fingerprint(path):
+    s = os.stat(path)
+    return {"size": s.st_size, "mtime": int(s.st_mtime)}
+
+
+def move_job(source, destination):
+    try:
+        os.replace(source, destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        fd, temporary = tempfile.mkstemp(
+            prefix=".mediacheck-", dir=os.path.dirname(destination),
+        )
+        os.close(fd)
+        try:
+            shutil.copyfile(source, temporary)
+            os.replace(temporary, destination)
+            os.unlink(source)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def lock(wait):
+    fh = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        return None
+    return fh
+
+
+# --------------------------------------------------------------- stages --
+
+def library_files(cfg):
+    for root in cfg["library_dirs"]:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in filenames:
+                if name.startswith(".") or ".fixed." in name:
+                    continue
+                if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                    yield os.path.join(dirpath, name)
+
+
+def settled(path, cfg):
+    """False while the file or its folder was touched recently - something
+    (a download, an upgrade, a manual remux) may still be writing there."""
+    cutoff = time.time() - cfg["settle_minutes"] * 60
+    return (os.stat(path).st_mtime < cutoff
+            and os.stat(os.path.dirname(path)).st_mtime < cutoff)
+
+
+def probe(path):
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=duration:stream=codec_type", "-of", "json", path],
+        capture_output=True, text=True, timeout=300,
+    )
+    if r.returncode:
+        return False, (r.stderr.strip().splitlines() or ["ffprobe failed"])[-1]
+    try:
+        info = json.loads(r.stdout)
+        duration = float(info["format"]["duration"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return False, (r.stderr.strip().splitlines() or ["no valid duration"])[-1]
+    if duration <= 0:
+        return False, "no positive duration"
+    if not any(s.get("codec_type") == "video" for s in info.get("streams", [])):
+        return False, "no video stream"
+    return True, "container metadata and video stream are readable"
+
+
+def run_fixer(path):
+    script = FIXERS.get(os.path.splitext(path)[1].lower())
+    if not script:
+        return "ok", "no fixer for this container", ""
+    r = subprocess.run([os.path.join(DIR, script), path], capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    last = next((l for l in reversed(out.splitlines()) if l.startswith("RESULT: ")), None)
+    if not last:
+        return "failed", f"{script} exited {r.returncode} without a result", out
+    status, _, why = last[len("RESULT: "):].partition(" - ")
+    return status, why, out
+
+
+# Transcription goes through LiteLLM (identity.transcription in
+# mediacheck.yaml): the local Whisper, or the GX10's while llama-local is
+# stopped for a game. Audio checks wait while neither is available rather than
+# turning every import into an "unverifiable" review.
+WHISPER_WAIT_SECONDS = 60
+TRANSCRIPTION_UNAVAILABLE_EXIT = 30
+IDENTITY_DEFER_EXIT = {31: "RATE_LIMITED", 32: "DOWNLOAD_FAILED"}
+# If transcription looks healthy but keeps failing, give up after this
+# many tries and report the error instead of waiting forever.
+TRANSCRIPTION_RETRIES_WHILE_UP = 3
+
+
+def _silence_wav():
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\0\0" * 16000)
+    return buf.getvalue()
+
+
+def whisper_check():
+    """(up, reason): up when a one-second transcription actually succeeds."""
+    try:
+        mclib.transcribe(_silence_wav(), filename="silence.wav", content_type="audio/wav", timeout=120)
+        return True, ""
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code} {e.reason}"
+    except (urllib.error.URLError, OSError, RuntimeError, ValueError, KeyError) as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def whisper_up():
+    return whisper_check()[0]
+
+
+def wait_for_whisper():
+    up, reason = whisper_check()
+    if up:
+        return
+    log(f"transcription is unavailable ({reason}); waiting for it before any audio identity check")
+    while not whisper_up():
+        time.sleep(WHISPER_WAIT_SECONDS)
+    log("transcription is back; resuming identity checks")
+
+
+def run_identity(path, allow_audio):
+    cmd = [sys.executable, os.path.join(DIR, "identity_check.py")]
+    if not allow_audio:
+        cmd.append("--no-audio")
+    failures_while_up = 0
+    while True:
+        if allow_audio:
+            wait_for_whisper()
+        r = subprocess.run(cmd + [path], capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        if r.returncode != TRANSCRIPTION_UNAVAILABLE_EXIT:
+            break
+        if whisper_up():
+            failures_while_up += 1
+            if failures_while_up >= TRANSCRIPTION_RETRIES_WHILE_UP:
+                break
+            time.sleep(WHISPER_WAIT_SECONDS)
+        log(f"transcription failed mid-check on {path}; waiting for it and re-running")
+    last = next((l for l in reversed(out.splitlines()) if l.startswith("VERDICT: ")), "")
+    result = IDENTITY_EXIT.get(r.returncode) or IDENTITY_DEFER_EXIT.get(r.returncode, "ERROR")
+    return result, last[len("VERDICT: "):] or out[-300:], out
+
+
+# ------------------------------------------------------------- outcomes --
+
+def flag_review(path, entry, reason, cfg, hint):
+    if entry.get("review") == reason:
+        return  # already reported
+    entry["review"] = reason
+    entry["review_since"] = datetime.now().isoformat(timespec="seconds")
+    log(f"REVIEW {path}: {reason}")
+    alert_admin(cfg, f"⚠️ **needs review**: `{short(path, cfg)}`\n{reason}\n{hint}")
+
+
+def do_reacquire(path, reason, st, cfg):
+    try:
+        summary = mclib.reacquire(path, reason, cfg)
+    except Exception as e:
+        summary = f"FAILED: {type(e).__name__}: {e}"
+    log(f"REACQUIRE {path}: {reason} -> {summary}")
+    if summary.startswith("FAILED"):
+        alert_admin(cfg, f"❌ **re-acquire failed**: `{short(path, cfg)}`\n{reason}\n{summary}\n"
+                         "Details in mediacheck.log.")
+    if not os.path.exists(path):
+        st["files"].pop(path, None)
+    else:
+        st["files"].setdefault(path, {})["review"] = f"re-acquire failed: {summary}"
+    return summary
+
+
+def fix_stage(path, st, cfg, probe_file=True):
+    """Run a quick readability probe and only matching compatibility fixes."""
+    entry = st["files"].setdefault(path, {})
+    if probe_file:
+        ok, err = probe(path)
+        if not ok:
+            reason = f"ffprobe can't read the file ({err})"
+            entry.update(fingerprint(path), fix="unreadable")
+            if cfg["policy"].get("reacquire_unreadable"):
+                do_reacquire(path, reason, st, cfg)
+                return ("unreadable" if os.path.exists(path) else "gone"), reason
+            flag_review(path, entry, reason, cfg, f"`mediacheck reacquire \"{path}\"`")
+            return "unreadable", reason
+
+    if entry.get("hold"):
+        status, why = "ok", "fixes on hold (restored by hand)"
+    else:
+        status, why, out = run_fixer(path)
+        with open(mclib.LOGFILE, "a") as f:
+            f.write(out)
+    entry["fix"] = status
+    if status == "fixed":
+        bak = path + ".bak"
+        if os.path.exists(bak):
+            st["backups"][bak] = time.time()
+        log(f"FIXED {path}: {why}")
+        try:
+            loc = mclib.locate(path, cfg)
+            if loc:
+                mclib.rescan(loc)
+        except Exception as e:
+            log(f"rescan after fix failed: {e}")
+            alert_admin(cfg, f"❌ **{'Sonarr' if '/tv/' in path else 'Radarr'} rescan failed** after fixing "
+                             f"`{short(path, cfg)}`: {e}\nThe file is fine; the library entry may be "
+                             "stale until its next refresh.")
+    elif status == "failed":
+        flag_review(path, entry, f"automatic fix failed: {why}", cfg,
+                    "Details in mediacheck.log. Replace it with "
+                    f"`mediacheck reacquire \"{path}\"`, or ignore with `mediacheck ok \"{path}\"`")
+    entry.update(fingerprint(path))
+    return status, why
+
+
+def identity_stage(path, st, cfg, allow_audio, verbose=False, final_try=True):
+    """Returns the identity result. RATE_LIMITED (and DOWNLOAD_FAILED unless
+    final_try) mean the check couldn't run yet: nothing is recorded, so the
+    caller can hold the file and try again later."""
+    entry = st["files"].setdefault(path, {})
+    result, detail, out = run_identity(path, allow_audio)
+    if verbose:
+        print(out, end="")
+    if result == "RATE_LIMITED" or (result == "DOWNLOAD_FAILED" and not final_try):
+        log(f"IDENTITY ON HOLD {path}: {detail}")
+        return result
+    if result == "DOWNLOAD_FAILED":
+        result = "ERROR"
+    errored = result == "ERROR"
+    if errored:
+        entry["identity_attempts"] = entry.get("identity_attempts", 0) + 1
+        log(f"identity check error on {path} (attempt {entry['identity_attempts']}): {detail}")
+        result, detail = "UNVERIFIABLE", (
+            f"identity check could not complete: {detail}; user decision required"
+        )
+    evidence = {}
+    for line in out.splitlines():
+        if line.startswith("EVIDENCE: "):
+            evidence.update(json.loads(line[len("EVIDENCE: "):]))
+    evidence = evidence or None
+    entry["identity"] = {"result": result, "detail": detail,
+                         "at": datetime.now().isoformat(timespec="seconds")}
+    if evidence:
+        entry["identity"]["evidence"] = evidence
+    log(f"IDENTITY {result} {path}: {detail}")
+    if result == "OK":
+        complete_pending_identity_replacements(
+            st, cfg, imported_path=path, identity_evidence=evidence,
+        )
+    # "Unverifiable" (e.g. no reference subtitle exists for the show) says
+    # nothing about the file, so it's only logged and listed by `status`;
+    # mismatches and real errors are DMed for a decision.
+    if (result == "MISMATCH" or errored) and not entry.get("confirmed"):
+        flag_identity_review(path, entry, detail, evidence, st, cfg)
+    return result
+
+
+def flag_identity_review(path, entry, detail, evidence, st, cfg):
+    result = (entry.get("identity") or {}).get("result", "UNVERIFIABLE")
+    reason = (
+        f"identity check {result.lower()} - {detail}; user decision required"
+    )
+    if entry.get("review") != reason:
+        entry["review"] = reason
+        entry["review_since"] = datetime.now().isoformat(timespec="seconds")
+        entry.pop("identity_review_id", None)
+        entry.pop("identity_review_notified", None)
+        log(f"REVIEW {path}: {reason}")
+    if entry.get("identity_review_notified"):
+        return
+
+    review_id = entry.get("identity_review_id")
+    if not review_id:
+        review_id = "MC-" + secrets.token_hex(4).upper()
+        entry["identity_review_id"] = review_id
+        save_state(st)
+    try:
+        source_stat = os.stat(path)
+    except FileNotFoundError:
+        source_stat = None
+    evidence = dict(evidence or {})
+    evidence.update({
+        "finding": detail,
+        "file_size_bytes": source_stat.st_size if source_stat else None,
+        "file_mtime": int(source_stat.st_mtime) if source_stat else None,
+        "file_mtime_ns": source_stat.st_mtime_ns if source_stat else None,
+        "file_inode": source_stat.st_ino if source_stat else None,
+        "media_path": path,
+    })
+    if evidence.get("arr_expected_runtime_minutes") is not None:
+        summary = (
+            f"The file is {float(evidence['media_duration_minutes']):.1f} minutes; "
+            f"Radarr lists the movie as "
+            f"{float(evidence['arr_expected_runtime_minutes']):.0f} minutes "
+            f"(difference {float(evidence['arr_runtime_difference_percent']):.1f}%). "
+            f"The centered audio sample matched {float(evidence.get('match_percent', 0)):.1f}% "
+            "of the subtitle's four-word phrases "
+            f"(threshold {float(evidence.get('threshold_percent', 0)):.1f}%)."
+        )
+    elif evidence.get("match_percent") is not None:
+        summary = (
+            f"The middle audio sample matched {float(evidence['match_percent']):.1f}% "
+            "of the external subtitle's four-word phrases. The review threshold is "
+            f"{float(evidence.get('threshold_percent', 0)):.1f}%. "
+            f"Reference provider: {evidence.get('reference_provider', 'unknown')}."
+        )
+    else:
+        summary = f"{result}: {detail}"
+    review = {
+        "review_id": review_id,
+        "source": "mediacheck",
+        "title": evidence.get("claimed_title") or evidence.get("claimed_movie")
+                 or evidence.get("claimed_episode")
+                 or os.path.basename(path),
+        "summary": summary,
+        "details": evidence,
+        "actions": [
+            {"command": "replace", "description": "quarantine this file and search for a replacement"},
+            {"command": "accept", "description": "keep this file and accept the review"},
+        ],
+    }
+    try:
+        mclib.request_identity_review(cfg, review)
+    except Exception as exc:
+        log(f"Debuggarr identity review DM failed for {review_id}: {type(exc).__name__}: {exc}")
+        return
+    entry["identity_review_notified"] = True
+    save_state(st)
+
+
+def complete_pending_identity_replacements(st, cfg, imported_path=None,
+                                           identity_evidence=None):
+    pending = st.setdefault("pending_identity_replacements", {})
+    processed = st.setdefault("review_results", {})
+    for review_id, item in list(pending.items()):
+        same_identity = (
+            item.get("identity_key")
+            and identity_evidence
+            and identity_evidence.get(item["identity_key"]) == item.get("identity_value")
+        )
+        same_path = (
+            imported_path and item.get("path") == imported_path
+            and not item.get("identity_key")
+        )
+        if imported_path and (same_identity or same_path):
+            item["passed"] = True
+            item["result"] = (
+                f"Replacement passed identity check: {short(imported_path, cfg)}"
+            )
+            save_state(st)
+        if not item.get("passed"):
+            continue
+        result = item["result"]
+        mclib.complete_identity_review(
+            cfg, review_id, result, legacy=item.get("legacy", False),
+        )
+        processed[review_id] = result
+        pending.pop(review_id)
+        save_state(st)
+        log(f"IDENTITY REVIEW {review_id} replacement verified; review DM removed")
+
+
+def cmd_reviews(args, cfg):
+    fh = lock(wait=True)
+    st = load_state()
+    processed = st.setdefault("review_results", {})
+    complete_pending_identity_replacements(st, cfg)
+    for review in mclib.list_identity_review_decisions(cfg):
+        review_id = review["review_id"]
+        if review_id in st.setdefault("pending_identity_replacements", {}):
+            continue
+        if review_id in processed:
+            mclib.complete_identity_review(
+                cfg, review_id, processed[review_id],
+                legacy=review.get("_legacy", False),
+            )
+            continue
+        evidence = review.get("details") or {}
+        path = evidence.get("media_path")
+        if not path:
+            raise RuntimeError(f"Debuggarr review {review_id} has no media_path in details")
+        entry = st["files"].get(path)
+        decision = review.get("decision")
+        if decision not in ("replace", "accept", "confirmed", "denied"):
+            continue
+        if entry is None or entry.get("identity_review_id") != review_id:
+            result = "Ignored: this review is no longer attached to the tracked file."
+        elif not os.path.exists(path):
+            entry.pop("review", None)
+            entry.pop("identity_review_id", None)
+            result = "Ignored: the reviewed file no longer exists in the library."
+        else:
+            current_stat = os.stat(path)
+            if (evidence.get("file_size_bytes") != current_stat.st_size
+                    or evidence.get("file_mtime_ns") != current_stat.st_mtime_ns
+                    or evidence.get("file_inode") != current_stat.st_ino):
+                entry.pop("review", None)
+                entry.pop("identity_review_id", None)
+                entry.pop("identity_review_notified", None)
+                entry.pop("identity", None)
+                result = "Ignored: the media file changed after this review was sent."
+            elif decision in ("accept", "denied"):
+                entry.pop("review", None)
+                entry["confirmed"] = datetime.now().isoformat(timespec="seconds")
+                entry["identity"] = {
+                    "result": "OK",
+                    "detail": "identity review accepted by admin; file kept",
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                }
+                entry.pop("identity_review_id", None)
+                entry.pop("identity_review_notified", None)
+                result = "Review accepted; the file is kept and marked reviewed."
+                complete_pending_identity_replacements(
+                    st, cfg, imported_path=path, identity_evidence=evidence,
+                )
+            else:
+                summary = mclib.reacquire(path, "identity review replacement approved by admin", cfg)
+                if os.path.exists(path):
+                    raise RuntimeError(f"confirmed review {review_id} could not replace the file: {summary}")
+                st["files"].pop(path, None)
+                result = "Replacement approved; " + summary
+                identity_key = next(
+                    (key for key in ("radarr_movie_id", "sonarr_episode_id")
+                     if evidence.get(key) is not None),
+                    None,
+                )
+                st.setdefault("pending_identity_replacements", {})[review_id] = {
+                    "path": path,
+                    "identity_key": identity_key,
+                    "identity_value": evidence.get(identity_key) if identity_key else None,
+                    "result": result,
+                    "legacy": review.get("_legacy", False),
+                    "passed": False,
+                }
+                save_state(st)
+                log(f"IDENTITY REVIEW {review_id} replacement search started; "
+                    "keeping the review DM until an imported replacement passes")
+                print(f"{review_id}: {result}; review DM retained until replacement passes")
+                continue
+
+        processed[review_id] = result
+        save_state(st)
+        mclib.complete_identity_review(
+            cfg, review_id, result, legacy=review.get("_legacy", False),
+        )
+        log(f"IDENTITY REVIEW {review_id} {decision}: {result}")
+        print(f"{review_id}: {result}")
+        if decision in ("accept", "denied") and entry is not None and os.path.exists(path):
+            complete_pending_identity_replacements(
+                st, cfg, imported_path=path, identity_evidence=evidence,
+            )
+    return 0
+
+
+def housekeeping(st, cfg):
+    """Drop our own backups and quarantined files once they've aged out."""
+    now = time.time()
+    for bak, made in list(st["backups"].items()):
+        if not os.path.exists(bak):
+            st["backups"].pop(bak)
+        elif now - made > cfg["backup_days"] * 86400:
+            os.remove(bak)
+            st["backups"].pop(bak)
+            log(f"removed backup older than {cfg['backup_days']} days: {bak}")
+    for d in glob.glob(os.path.join(cfg["quarantine_dir"], "*")):
+        if now - os.stat(d).st_mtime > cfg["quarantine_days"] * 86400:
+            shutil.rmtree(d)
+            log(f"removed quarantine older than {cfg['quarantine_days']} days: {d}")
+    for path in [p for p in st["files"] if not os.path.exists(p)]:
+        st["files"].pop(path)
+
+
+# ------------------------------------------------------------- commands --
+
+def cmd_watch(args, cfg):
+    fh = lock(wait=False)
+    if not fh:
+        return 0  # previous run still busy (e.g. a long remux)
+    st = load_state()
+    housekeeping(st, cfg)
+
+    pending_identity = []
+    for path in library_files(cfg):
+        entry = st["files"].get(path, {})
+        try:
+            changed = {k: entry.get(k) for k in ("size", "mtime")} != fingerprint(path)
+            if changed and not settled(path, cfg):
+                continue
+        except FileNotFoundError:
+            continue  # moved/deleted since the folder was listed
+        if changed or args.all:
+            if changed:
+                entry.pop("identity", None)
+                entry.pop("identity_attempts", None)
+                entry.pop("identity_review_id", None)
+                entry.pop("identity_review_notified", None)
+                entry.pop("confirmed", None)
+            status, _ = fix_stage(path, st, cfg)
+            save_state(st)
+            if status == "gone":
+                continue
+        entry = st["files"].get(path, {})
+        if (entry.get("fix") in ("ok", "fixed") and "identity" not in entry
+                and not entry.get("confirmed")):
+            pending_identity.append(path)
+
+    # Identity checks are slow, so they come after every fix and within a
+    # time budget; newest files first so fresh imports aren't stuck behind
+    # the backfill of the existing library.
+    if cfg["identity"]["enabled"] and not args.all:
+        deadline = time.time() + cfg["identity"]["max_minutes_per_run"] * 60
+        pending_identity.sort(key=lambda p: os.stat(p).st_ctime if os.path.exists(p) else 0,
+                              reverse=True)
+        for path in pending_identity:
+            if time.time() > deadline:
+                break
+            if os.path.exists(path):
+                identity_stage(path, st, cfg, cfg["identity"]["use_audio"])
+                save_state(st)
+    save_state(st)
+    return 0
+
+
+def read_job(job):
+    fields = {}
+    with open(job) as f:
+        for line in f:
+            k, _, v = line.rstrip("\n").partition("=")
+            fields[k] = v
+    return fields
+
+
+HOOK_INPROGRESS = os.path.join(mclib.DATA_DIR, "hook-inprogress")
+
+
+def recover_interrupted_jobs():
+    """Put jobs that were mid-check when mediacheck stopped (a reboot, a
+    stopped service) back on their queue - once. A job interrupted twice is
+    dropped and logged, so a file that crashes mediacheck can't loop."""
+    for held in sorted(glob.glob(os.path.join(HOOK_INPROGRESS, "*.job"))):
+        fields = read_job(held)
+        queue = fields.get("queue")
+        if fields.get("recovered") or not queue or not os.path.isdir(queue):
+            log(f"HOOK interrupted twice, dropped: {fields.get('path') or held}")
+            os.remove(held)
+            continue
+        with open(held, "a") as f:
+            f.write("recovered=1\n")
+        move_job(held, os.path.join(queue, os.path.basename(held)))
+        log(f"HOOK re-queued interrupted job: {fields.get('path') or held}")
+
+
+HOOK_DEFERRED = os.path.join(mclib.DATA_DIR, "hook-deferred")
+# How often an on-hold check is retried. A rate-limited one also waits until
+# Bazarr shows none of its providers throttled.
+DEFER_RETRY_SECONDS = {"RATE_LIMITED": 15 * 60, "DOWNLOAD_FAILED": 30 * 60}
+# Listed subtitles that can't be downloaded this many times in a row turn
+# into an error review instead of waiting forever.
+DOWNLOAD_FAILED_TRIES = 3
+# Bazarr throttle reasons that need the admin, not time.
+PROVIDER_NEEDS_ADMIN = ("AuthenticationError", "ConfigurationError", "PaymentRequired")
+# Must match identity_check.RATE_LIMIT_REASONS: a provider that's merely
+# broken (HTTPError, ...) doesn't hold checks.
+HOLD_REASONS = ("TooManyRequests", "DownloadLimitExceeded", "APIThrottled",
+                "ServiceUnavailable") + PROVIDER_NEEDS_ADMIN
+
+
+def bazarr_throttled(cfg):
+    """Bazarr providers held back for a rate limit or a login/config problem,
+    as [(name, reason, retry)], or None if Bazarr can't be asked."""
+    try:
+        with open(cfg["identity"]["bazarr"]["config_file"]) as f:
+            key = ((yaml.safe_load(f) or {}).get("auth") or {}).get("apikey")
+        url = cfg["identity"]["bazarr"]["url"].rstrip("/") + "/api/providers"
+        req = urllib.request.Request(url, headers={"X-API-KEY": key})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            rows = json.loads(resp.read()).get("data", [])
+    except Exception:
+        return None
+    return [(r["name"], r.get("status"), r.get("retry")) for r in rows
+            if r.get("status") in HOLD_REASONS]
+
+
+def report_broken_providers(cfg, throttled):
+    for name, reason, retry in throttled or []:
+        if reason in PROVIDER_NEEDS_ADMIN:
+            alert_admin(cfg, f"⚠️ Bazarr subtitle provider **{name}** is disabled ({reason}). "
+                             "Identity checks that need it are on hold until it's fixed "
+                             "in Bazarr > Settings > Providers.",
+                        notification_id=f"bazarr-provider-{name}")
+
+
+def defer_job(held, fields, result, detail):
+    tries = int(fields.get(f"tries_{result}") or 0) + 1
+    fields.update({
+        "defer_reason": result,
+        f"tries_{result}": str(tries),
+        "not_before": str(int(time.time()) + DEFER_RETRY_SECONDS[result]),
+    })
+    fields.pop("recovered", None)
+    with open(held, "w") as f:
+        f.writelines(f"{k}={v}\n" for k, v in fields.items())
+    move_job(held, os.path.join(HOOK_DEFERRED, os.path.basename(held)))
+    log(f"HOOK on hold ({result}, try {tries}), will retry later: {fields.get('path')}")
+
+
+def due_deferred_jobs(cfg):
+    jobs = sorted(glob.glob(os.path.join(HOOK_DEFERRED, "*.job")))
+    if not jobs:
+        return [], False
+    now = time.time()
+    throttled = None
+    due = []
+    for job in jobs:
+        fields = read_job(job)
+        if now < int(fields.get("not_before") or 0):
+            continue
+        if fields.get("defer_reason") == "RATE_LIMITED":
+            if throttled is None:
+                throttled = bazarr_throttled(cfg)
+                report_broken_providers(cfg, throttled)
+            if throttled is None or throttled:
+                continue
+        due.append(job)
+    return due, True
+
+
+def cmd_hook(args, cfg):
+    """Process the imports Sonarr/Radarr queued through arr_hook.sh. Each job
+    is moved out of the queue to hook-inprogress/ while it's worked on and
+    deleted when done; see recover_interrupted_jobs for what happens if
+    mediacheck stops part-way."""
+    fh = lock(wait=True)  # wait out a long remux from an earlier import
+    os.makedirs(HOOK_INPROGRESS, exist_ok=True)
+    os.makedirs(HOOK_DEFERRED, exist_ok=True)
+    recover_interrupted_jobs()
+    st = load_state()
+    housekeeping(st, cfg)
+    while True:
+        jobs = sorted(j for q in cfg["hook_queues"] for j in glob.glob(os.path.join(q, "*.job")))
+        deferred, waiting = due_deferred_jobs(cfg)
+        jobs += deferred
+        if not jobs:
+            if not waiting:
+                break
+            # Only on-hold checks are left: let go of the lock (so manual
+            # commands aren't blocked) and look again in a minute.
+            fh.close()
+            time.sleep(60)
+            fh = lock(wait=True)
+            st = load_state()
+            continue
+        for job in jobs:
+            # Wait before taking the job off the queue, so stopping mediacheck
+            # while it waits loses nothing.
+            if identity_on_import(cfg) and cfg["identity"]["use_audio"]:
+                wait_for_whisper()
+            fields = read_job(job)
+            held = os.path.join(HOOK_INPROGRESS, os.path.basename(job))
+            if "queue" not in fields:
+                with open(job, "a") as f:
+                    f.write(f"queue={os.path.dirname(job)}\n")
+            move_job(job, held)
+            try:
+                result, detail = hook_job(fields, st, cfg)
+            finally:
+                save_state(st)
+            if result in DEFER_RETRY_SECONDS:
+                defer_job(held, fields, result, detail)
+            else:
+                os.remove(held)
+    return 0
+
+
+def cmd_service(args, cfg):
+    """Wait for Arr import queues and deferred import checks; never scan libraries."""
+    queues = cfg["hook_queues"]
+    poll_seconds = max(1, args.poll_seconds)
+    log(f"mediacheck service started; polling Arr import queues every {poll_seconds}s", echo=True)
+    while True:
+        has_work = any(glob.glob(os.path.join(queue, "*.job")) for queue in queues)
+        has_work = has_work or bool(glob.glob(os.path.join(HOOK_DEFERRED, "*.job")))
+        if has_work:
+            cmd_hook(args, cfg)
+        time.sleep(poll_seconds)
+
+
+def hook_job(fields, st, cfg):
+    path = fields.get("path", "").replace(cfg["arr_media_root"], cfg["host_media_root"], 1)
+    what = f"{fields.get('app')} {'upgrade' if fields.get('upgrade') == 'True' else 'import'}"
+    if not path or not os.path.exists(path):
+        log(f"HOOK {what}: file no longer exists, skipped: {path or '(no path)'}")
+        return None, None
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in VIDEO_EXTS:
+        log(f"HOOK {what}: unsupported container, skipped: {path}")
+        return None, None
+    current = fingerprint(path)
+    entry = st["files"].get(path, {})
+    changed = any(entry.get(k) != v for k, v in current.items())
+    if changed:
+        entry.pop("identity", None)
+        entry.pop("identity_attempts", None)
+        entry.pop("identity_review_id", None)
+        entry.pop("identity_review_notified", None)
+        entry.pop("confirmed", None)
+    if (entry.get("fix") in ("ok", "fixed")
+            and all(entry.get(k) == v for k, v in current.items())
+            and (not identity_on_import(cfg)
+                 or "identity" in entry or entry.get("confirmed"))):
+        log(f"HOOK {what}: unchanged file already checked, skipped: {path}")
+        return None, None
+    log(f"HOOK {what}: {path} (release: {fields.get('release') or 'unknown'})")
+    status, _ = fix_stage(path, st, cfg, probe_file=True)
+    entry = st["files"].get(path, {})
+    if (status in ("ok", "fixed") and identity_on_import(cfg)
+            and "identity" not in entry and not entry.get("confirmed")):
+        final_try = int(fields.get("tries_DOWNLOAD_FAILED") or 0) + 1 >= DOWNLOAD_FAILED_TRIES
+        result = identity_stage(path, st, cfg, cfg["identity"]["use_audio"],
+                                final_try=final_try)
+        return result, None
+    return None, None
+
+
+def identity_on_import(cfg):
+    identity = cfg["identity"]
+    return identity.get("enabled", False) and identity.get("on_import", False)
+
+
+def cmd_scan(args, cfg):
+    args.all = True
+    log("==== library scan starting ====")
+    rc = cmd_watch(args, cfg)
+    log("==== library scan finished ====")
+    return rc
+
+
+def cmd_check(args, cfg):
+    path = os.path.abspath(args.file)
+    fh = lock(wait=True)
+    st = load_state()
+    print("== 1/3 probe"); ok, err = probe(path)
+    print("   readable" if ok else f"   UNREADABLE: {err}")
+    if not ok:
+        print(f"\nDecision: RE-ACQUIRE  ->  mediacheck reacquire \"{path}\"")
+        return 1
+    print("== 2/3 fix (layout / Plex-unsafe audio)")
+    status, why = fix_stage(path, st, cfg)
+    save_state(st)
+    print(f"   {status}: {why}")
+    print("== 3/3 identity (may transcribe audio - slow)")
+    result = identity_stage(path, st, cfg, allow_audio=not args.no_audio, verbose=True)
+    save_state(st)
+    e = st["files"].get(path, {})
+    print(f"\nDecision: {'REVIEW - ' + e['review'] if e.get('review') else 'OK'}"
+          f" (identity: {result})")
+    return 0
+
+
+def cmd_status(args, cfg):
+    st = load_state()
+    files = st["files"]
+    reviews = {p: e for p, e in files.items() if e.get("review")}
+    by_id = {}
+    for e in files.values():
+        r = (e.get("identity") or {}).get("result", "not yet checked")
+        by_id[r] = by_id.get(r, 0) + 1
+    print(f"{len(files)} files tracked; fix stage: "
+          f"{sum(1 for e in files.values() if e.get('fix') == 'fixed')} fixed, "
+          f"{sum(1 for e in files.values() if e.get('fix') == 'failed')} failed")
+    print("identity: " + ", ".join(f"{v} {k}" for k, v in sorted(by_id.items())))
+    print(f"backups kept: {len(st['backups'])}")
+    print(f"\n{len(reviews)} waiting for review:")
+    for p, e in sorted(reviews.items(), key=lambda x: x[1].get("review_since", "")):
+        print(f"  - {short(p, cfg)}\n      {e['review']}")
+    unverifiable = {p: e for p, e in files.items()
+                    if (e.get("identity") or {}).get("result") == "UNVERIFIABLE"
+                    and not e.get("review")}
+    print(f"\n{len(unverifiable)} unverifiable (logged only, no DM):")
+    for p, e in sorted(unverifiable.items()):
+        print(f"  - {short(p, cfg)}\n      {e['identity']['detail']}")
+    return 0
+
+
+def cmd_reacquire(args, cfg):
+    path = os.path.abspath(args.file)
+    if args.dry_run:
+        print(mclib.reacquire(path, "manual", cfg, dry_run=True))
+        return 0
+    fh = lock(wait=True)
+    st = load_state()
+    print(do_reacquire(path, "requested by hand", st, cfg))
+    save_state(st)
+    return 0
+
+
+def cmd_ok(args, cfg):
+    path = os.path.abspath(args.file)
+    fh = lock(wait=True)
+    st = load_state()
+    e = st["files"].setdefault(path, {})
+    e.pop("review", None)
+    e["confirmed"] = datetime.now().isoformat(timespec="seconds")
+    e.update(fingerprint(path))
+    save_state(st)
+    log(f"marked OK by hand: {path}")
+    print("Marked as correct - it won't be flagged again unless the file changes.")
+    return 0
+
+
+def cmd_restore(args, cfg):
+    """Put an original back. Handles both mediacheck's same-name backups
+    (<file>.bak) and the old remux's <name>.mkv.bak next to a stripped .mp4."""
+    path = os.path.abspath(args.file)
+    fh = lock(wait=True)
+    st = load_state()
+    same = path + ".bak"
+    legacy = os.path.splitext(path)[0] + ".mkv.bak"
+    if os.path.exists(same):
+        target, hold = path, True
+        backup = same
+    elif path.lower().endswith(".mp4") and os.path.exists(legacy):
+        target, hold = legacy[:-4], False  # the .mkv - watch will re-fix it properly
+        backup = legacy
+    else:
+        print(f"No backup found for {path}")
+        return 1
+    moved = mclib.quarantine(path, cfg)
+    os.rename(backup, target)
+    st["backups"].pop(backup, None)
+    st["files"].pop(path, None)
+    if hold:
+        st["files"][target] = dict(fingerprint(target), hold=True)
+    save_state(st)
+    log(f"RESTORED {target} from {backup}; replaced file quarantined at {moved}")
+    try:
+        loc = mclib.locate(target, cfg)
+        if loc:
+            mclib.rescan(loc)
+    except Exception as e:
+        log(f"rescan after restore failed: {e}")
+    print(f"Restored {target}\n(the file it replaced is in quarantine: {moved})")
+    if hold:
+        print("Automatic fixes are on hold for this file.")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("hook")
+    p = sub.add_parser("service")
+    p.add_argument("--poll-seconds", type=int, default=5)
+    sub.add_parser("reviews")
+    p = sub.add_parser("watch"); p.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
+    p = sub.add_parser("scan"); p.set_defaults(all=True)
+    p = sub.add_parser("check"); p.add_argument("file"); p.add_argument("--no-audio", action="store_true")
+    sub.add_parser("status")
+    p = sub.add_parser("reacquire"); p.add_argument("file"); p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("ok"); p.add_argument("file")
+    p = sub.add_parser("restore"); p.add_argument("file")
+    args = ap.parse_args()
+    cfg = mclib.load_config()
+    try:
+        result = globals()["cmd_" + args.cmd](args, cfg)
+        if args.cmd in ("hook", "service", "watch", "scan", "reviews"):
+            try:
+                mclib.resolve_admin_notification(
+                    cfg, f"crash-{args.cmd}", source="mediacheck",
+                )
+            except Exception as cleanup_error:
+                log(f"could not clear recovered Debuggarr crash notification for "
+                    f"mediacheck {args.cmd}: {type(cleanup_error).__name__}: {cleanup_error}")
+        return result
+    except Exception as e:
+        # These run unattended, where nobody sees a traceback.
+        if args.cmd in ("hook", "service", "watch", "scan", "reviews"):
+            # Alert first: if the disk is full, writing the log fails too.
+            alert_admin(cfg, f"💥 **`mediacheck {args.cmd}` crashed**: {type(e).__name__}: {e}\n"
+                             "Details in mediacheck.log.",
+                        notification_id=f"crash-{args.cmd}")
+            try:
+                log(f"{args.cmd} crashed: {type(e).__name__}: {e}")
+            except OSError:
+                pass
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(main())

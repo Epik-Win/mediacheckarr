@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.env.*
+*.db
+*.db-*
+*.log
+checkrr.yaml
+mediacheck.yaml
+mediacheck_state.json
+hook-inprogress
+hook-deferred
+webserver/build
+webserver/node_modules
+mediacheck/__pycache__

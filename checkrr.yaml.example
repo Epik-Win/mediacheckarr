@@ -9,7 +9,8 @@ checkrr:
   database: ./checkrr.db
   debug: true
   csvfile: "./badfiles.csv"
-  cron: "@daily"
+  # Empty disables automatic scans; run them from the web UI or API.
+  cron: ""
   ignorehidden: true
   requireaudio: true
   ffmpeg-full: false
