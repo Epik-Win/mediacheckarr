@@ -64,7 +64,7 @@ def log(msg, echo=False):
 
 
 DEBUGGARR_ENV = os.environ.get(
-    "DEBUGGARR_API_SECRET_FILE", "/srv/media_server/debuggarr/.env",
+    "DEBUGGARR_API_SECRET_FILE", "/run/secrets/debuggarr.env",
 )
 
 
@@ -142,6 +142,48 @@ def _debuggarr_secret():
     raise RuntimeError(f"API_SECRET not set in {DEBUGGARR_ENV}")
 
 
+def _secret_value(name):
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    try:
+        with open(DEBUGGARR_ENV) as f:
+            for line in f:
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def _telegram_alert(msg):
+    token = _secret_value("MEDIACHECK_TELEGRAM_BOT_TOKEN")
+    chat_id = _secret_value("MEDIACHECK_TELEGRAM_CHAT_ID")
+    if not token and not chat_id:
+        return
+    if not token or not chat_id:
+        raise RuntimeError(
+            "Both MEDIACHECK_TELEGRAM_BOT_TOKEN and MEDIACHECK_TELEGRAM_CHAT_ID are required"
+        )
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": msg[:4000],
+        }).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            result = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"Telegram API returned HTTP {error.code}") from None
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Telegram request failed: {error.reason}") from None
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram did not confirm the alert: {result}")
+
+
 def debuggarr_request(cfg, path, method="GET", payload=None):
     url = f"{_debuggarr_api_url(cfg)}/{path.lstrip('/')}"
     data = json.dumps(payload).encode() if payload is not None else None
@@ -194,7 +236,7 @@ def withdraw_identity_review(cfg, review_id, result):
 
 
 def alert_admin(cfg, msg, notification_id=None):
-    """DM the admin through Debuggarr; never post alerts to a public channel."""
+    """Notify the admin privately through Debuggarr and/or Telegram."""
     if os.environ.get("MEDIACHECK_NOTIFY") == "0":
         log(f"admin alert (suppressed): {msg}")
         return
@@ -213,6 +255,10 @@ def alert_admin(cfg, msg, notification_id=None):
             raise RuntimeError(f"Debuggarr did not confirm the DM was sent: {result}")
     except Exception as e:
         log(f"Debuggarr admin DM failed; no channel fallback: {type(e).__name__}: {e}")
+    try:
+        _telegram_alert(msg)
+    except Exception as e:
+        log(f"Telegram admin alert failed: {type(e).__name__}: {e}")
 
 
 def resolve_admin_notification(cfg, notification_id, source="mediacheck"):
