@@ -1,7 +1,6 @@
 services:
   mediacheckarr:
-    build: .
-    image: epik-win/mediacheckarr:latest
+    image: ghcr.io/epik-win/mediacheckarr:latest
     container_name: mediacheckarr
     restart: unless-stopped
     user: "${PUID:-1000}:${PGID:-1000}"

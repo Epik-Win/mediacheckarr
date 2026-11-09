@@ -2,6 +2,7 @@ package notifications
 
 import (
 	"fmt"
+	"strings"
 	"github.com/aetaric/checkrr/logging"
 	"github.com/knadh/koanf/v2"
 	"github.com/nicksnyder/go-i18n/v2/i18n"
@@ -21,6 +22,13 @@ type Telegram struct {
 	Localizer     *i18n.Localizer
 }
 
+func (t Telegram) safeError(err error) string {
+	if t.apiToken == "" {
+		return err.Error()
+	}
+	return strings.ReplaceAll(err.Error(), t.apiToken, "[redacted]")
+}
+
 func (t Telegram) Notify(title string, description string, notifType string, path string) bool {
 	var allowed bool = false
 	for _, notif := range t.AllowedNotifs {
@@ -30,7 +38,10 @@ func (t Telegram) Notify(title string, description string, notifType string, pat
 	}
 	if allowed {
 		message := tgbotapi.NewMessage(t.chatid, description)
-		t.bot.Send(message)
+		if _, err := t.bot.Send(message); err != nil {
+			t.Log.WithFields(log.Fields{"Error": err, "ChatID": t.chatid}).Error("Telegram notification failed")
+			return false
+		}
 		return true
 	}
 	return false
@@ -46,25 +57,27 @@ func (t *Telegram) Connect() bool {
 
 	t.bot, err = tgbotapi.NewBotAPI(t.apiToken)
 	if err != nil {
+		safeErr := t.safeError(err)
 		message := t.Localizer.MustLocalize(&i18n.LocalizeConfig{
 			MessageID: "NotificationsTelegramError",
 			TemplateData: map[string]interface{}{
-				"Error": err.Error(),
+				"Error": safeErr,
 			},
 		})
-		t.Log.WithFields(log.Fields{"Error": err, "Username": t.username, "Token": t.apiToken}).Warn(message)
+		t.Log.WithFields(log.Fields{"Error": safeErr, "Username": t.username}).Warn(message)
 		return false
 	}
 
 	updates, err := t.bot.GetUpdates(tgbotapi.UpdateConfig{})
 	if err != nil {
+		safeErr := t.safeError(err)
 		message := t.Localizer.MustLocalize(&i18n.LocalizeConfig{
 			MessageID: "NotificationsTelegramError",
 			TemplateData: map[string]interface{}{
-				"Error": err.Error(),
+				"Error": safeErr,
 			},
 		})
-		t.Log.WithFields(log.Fields{"Error": err, "Username": t.username, "Token": t.apiToken}).Warn(message)
+		t.Log.WithFields(log.Fields{"Error": safeErr, "Username": t.username}).Warn(message)
 		return false
 	}
 	if t.chatid == 0 {
