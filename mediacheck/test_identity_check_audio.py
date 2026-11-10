@@ -1,6 +1,9 @@
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -227,6 +230,45 @@ class SubtitleCatDownloadUrlTests(unittest.TestCase):
                 {"url": "https://www.subtitlecat.com/subs/1044/toy.html", "language": "en"})
         self.assertEqual(requested[1],
                          "https://www.subtitlecat.com/subs/1044/Toy%20Story%202%20%281999%29.eng-en.srt")
+
+
+class MissingBazarrEpisodeTests(unittest.TestCase):
+    identity = {
+        "series_id": 37,
+        "episode_id": 4845,
+        "reference_language": {"name": "English", "code2": "en", "code3": "eng"},
+    }
+
+    def test_episode_not_found_404_becomes_unverifiable_without_error(self):
+        error = urllib.error.HTTPError(
+            "http://bazarr/api/providers/episodes", 404, "NOT FOUND", {},
+            io.BytesIO(b'"Episode not found"'),
+        )
+
+        def request(*args, **kwargs):
+            raise error
+
+        @contextlib.contextmanager
+        def validation_profile(*args, **kwargs):
+            yield request
+
+        with (
+            patch.object(identity_check, "bazarr_validation_profile", validation_profile),
+            patch.object(identity_check, "validation_profile_name", return_value="test"),
+            patch.object(identity_check, "log") as log,
+            patch.dict(identity_check._IDENTITY["bazarr"], {"reference_provider": "gestdown"}),
+        ):
+            self.assertEqual(list(identity_check.iter_episode_references(self.identity)), [])
+            self.assertIn("BAZARR_EPISODE_NOT_INDEXED", log.call_args.args[0])
+
+        with (
+            patch.object(identity_check, "bazarr_throttled_providers", return_value=[]),
+            patch.object(identity_check.ReferenceSearch, "rate_limited", []),
+            patch.object(identity_check.ReferenceSearch, "download_failures", 0),
+        ):
+            with self.assertRaises(SystemExit) as result:
+                identity_check.no_reference_verdict("no usable subtitle", is_tv=True)
+        self.assertEqual(result.exception.code, identity_check.EXIT_CODES["UNVERIFIABLE"])
 
 
 if __name__ == "__main__":

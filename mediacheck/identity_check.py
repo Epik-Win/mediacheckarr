@@ -411,11 +411,33 @@ def iter_episode_references(identity):
     preferred = settings["reference_provider"]
     max_tries = int(settings.get("max_episode_reference_tries", 6))
     lang = identity["reference_language"]
-    with bazarr_validation_profile(identity["series_id"],
-                                   validation_profile_name(lang)) as request:
-        result = request(
-            "GET", "providers/episodes", [("episodeid", identity["episode_id"])],
-            timeout=180)
+    try:
+        with bazarr_validation_profile(identity["series_id"],
+                                       validation_profile_name(lang)) as request:
+            result = request(
+                "GET", "providers/episodes", [("episodeid", identity["episode_id"])],
+                timeout=180)
+    except RuntimeError as exc:
+        if str(exc) != f"Bazarr returned 0 series for Sonarr ID {identity['series_id']}":
+            raise
+        log(
+            "WARNING: BAZARR_EPISODE_NOT_INDEXED: Bazarr has no series record "
+            f"for Sonarr series {identity['series_id']}; skipping subtitle "
+            "comparison and accepting the imported file"
+        )
+        return
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        response_body = exc.read().decode(errors="replace").strip().strip('"')
+        if response_body != "Episode not found":
+            raise
+        log(
+            "WARNING: BAZARR_EPISODE_NOT_INDEXED: Bazarr has no record "
+            f"for Sonarr episode {identity['episode_id']}; skipping subtitle "
+            "comparison and accepting the imported file"
+        )
+        return
     candidates = result.get("data", []) if result else []
     suitable = [
         c for c in candidates

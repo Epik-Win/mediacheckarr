@@ -344,11 +344,15 @@ def identity_stage(path, st, cfg, allow_audio, verbose=False, final_try=True):
         return result
     if result == "DOWNLOAD_FAILED":
         result = "ERROR"
-    missing_bazarr_record = result == "ERROR" and is_missing_bazarr_record(detail)
+    missing_bazarr_record = (
+        (result == "ERROR" and is_missing_bazarr_record(detail))
+        or "WARNING: BAZARR_EPISODE_NOT_INDEXED:" in out
+    )
     errored = result == "ERROR" and not missing_bazarr_record
     if missing_bazarr_record:
         result = "UNVERIFIABLE"
         detail = "Bazarr has no record for this import; no subtitle reference is available"
+        entry.pop("identity_attempts", None)
     elif errored:
         entry["identity_attempts"] = entry.get("identity_attempts", 0) + 1
         log(f"identity check error on {path} (attempt {entry['identity_attempts']}): {detail}")
@@ -365,6 +369,24 @@ def identity_stage(path, st, cfg, allow_audio, verbose=False, final_try=True):
     if evidence:
         entry["identity"]["evidence"] = evidence
     log(f"IDENTITY {result} {path}: {detail}")
+    if missing_bazarr_record:
+        log(f"IMPORT ACCEPTED {path}: Bazarr has no subtitle index for this episode")
+        review_id = entry.get("identity_review_id")
+        if review_id:
+            try:
+                mclib.withdraw_identity_review(
+                    cfg, review_id,
+                    "Withdrawn: Bazarr has no episode record to search for subtitles; "
+                    "the Sonarr import is accepted.",
+                )
+            except Exception as exc:
+                log(f"could not withdraw stale Debuggarr review {review_id}: "
+                    f"{type(exc).__name__}: {exc}")
+            else:
+                log(f"WITHDREW Debuggarr review {review_id}: no Bazarr episode index")
+                for key in ("review", "review_since", "identity_review_id",
+                            "identity_review_notified"):
+                    entry.pop(key, None)
     if result == "OK":
         complete_pending_identity_replacements(
             st, cfg, imported_path=path, identity_evidence=evidence,
