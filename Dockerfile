@@ -1,4 +1,4 @@
-FROM node:20-alpine AS web-build
+FROM --platform=$BUILDPLATFORM node:20-alpine AS web-build
 WORKDIR /src/webserver
 RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 COPY webserver/package.json webserver/pnpm-lock.yaml ./
