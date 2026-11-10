@@ -26,6 +26,8 @@ Docker image.
   references or Bazarr catalog entries (including Bazarr's `Episode not found`
   response) are treated as unverifiable and logged internally without a
   Debuggarr alert; the Sonarr/Radarr import is accepted and the file is kept.
+  Subtitle availability is checked before waiting for transcription, so an
+  import with no reference subtitle does not wait on Whisper.
   Actual audio/title mismatches and other identity-check errors that need
   attention are sent privately to the configured admin through Debuggarr and,
   optionally, Telegram. Mediacheck does not post to a Discord channel or

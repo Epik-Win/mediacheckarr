@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
@@ -16,6 +17,48 @@ spec.loader.exec_module(mediacheck)
 
 
 class MissingBazarrReferenceTests(unittest.TestCase):
+    def test_run_identity_checks_subtitles_before_waiting_for_whisper(self):
+        response = type("Result", (), {
+            "returncode": 20,
+            "stdout": "VERDICT: UNVERIFIABLE - no usable subtitle\n",
+            "stderr": "",
+        })()
+        with (
+            patch.object(mediacheck.subprocess, "run", return_value=response),
+            patch.object(mediacheck, "wait_for_whisper") as wait,
+        ):
+            result, detail, _ = mediacheck.run_identity("/library/example.mkv", True)
+        self.assertEqual(result, "UNVERIFIABLE")
+        self.assertIn("no usable subtitle", detail)
+        wait.assert_not_called()
+
+    def test_hook_does_not_wait_for_whisper_before_acceptance(self):
+        with tempfile.TemporaryDirectory() as root:
+            queue = Path(root) / "queue"
+            inprogress = Path(root) / "inprogress"
+            deferred = Path(root) / "deferred"
+            queue.mkdir()
+            (queue / "test.job").write_text("app=sonarr\npath=/media/example.mkv\n")
+            cfg = {
+                "hook_queues": [str(queue)],
+                "identity": {"on_import": True, "use_audio": True},
+            }
+            with (
+                patch.object(mediacheck, "HOOK_INPROGRESS", str(inprogress)),
+                patch.object(mediacheck, "HOOK_DEFERRED", str(deferred)),
+                patch.object(mediacheck, "lock", return_value=object()),
+                patch.object(mediacheck, "recover_interrupted_jobs"),
+                patch.object(mediacheck, "load_state", return_value={"files": {}}),
+                patch.object(mediacheck, "housekeeping"),
+                patch.object(mediacheck, "due_deferred_jobs", return_value=([], False)),
+                patch.object(mediacheck, "hook_job", return_value=("UNVERIFIABLE", None)) as hook,
+                patch.object(mediacheck, "save_state"),
+                patch.object(mediacheck, "wait_for_whisper") as wait,
+            ):
+                mediacheck.cmd_hook(None, cfg)
+            hook.assert_called_once()
+            wait.assert_not_called()
+
     def run_identity_outcome(self, detail):
         state = {"files": {}}
         with (

@@ -244,17 +244,21 @@ def run_identity(path, allow_audio):
         cmd.append("--no-audio")
     failures_while_up = 0
     while True:
-        if allow_audio:
-            wait_for_whisper()
         r = subprocess.run(cmd + [path], capture_output=True, text=True)
         out = r.stdout + r.stderr
         if r.returncode != TRANSCRIPTION_UNAVAILABLE_EXIT:
+            break
+        if not allow_audio:
             break
         if whisper_up():
             failures_while_up += 1
             if failures_while_up >= TRANSCRIPTION_RETRIES_WHILE_UP:
                 break
             time.sleep(WHISPER_WAIT_SECONDS)
+        else:
+            log(f"transcription failed mid-check on {path}; waiting for it and re-running")
+            wait_for_whisper()
+            continue
         log(f"transcription failed mid-check on {path}; waiting for it and re-running")
     last = next((l for l in reversed(out.splitlines()) if l.startswith("VERDICT: ")), "")
     result = IDENTITY_EXIT.get(r.returncode) or IDENTITY_DEFER_EXIT.get(r.returncode, "ERROR")
@@ -795,10 +799,6 @@ def cmd_hook(args, cfg):
             st = load_state()
             continue
         for job in jobs:
-            # Wait before taking the job off the queue, so stopping mediacheck
-            # while it waits loses nothing.
-            if identity_on_import(cfg) and cfg["identity"]["use_audio"]:
-                wait_for_whisper()
             fields = read_job(job)
             held = os.path.join(HOOK_INPROGRESS, os.path.basename(job))
             if "queue" not in fields:
