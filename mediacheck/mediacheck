@@ -12,8 +12,9 @@ one outcome:
               HEVC 10-bit MKV with EAC3 5.1(side) FIX in place (add AAC
               main audio (Taken)                   track, keep everything)
               a fix fails                          REVIEW
-  identity    mismatch or unverifiable result      REVIEW; explicit approval
-                                                   is required to keep/replace
+  identity    audio differs from exact-title text  REVIEW
+              no subtitle reference is available   logged only; import accepted
+              another identity check fails         REVIEW
 
   FIX         = fix_mp4_interleave.sh / fix_mkv_audio.sh; the original is
                 kept as <name>.bak for backup_days.
@@ -77,6 +78,13 @@ VIDEO_EXTS = (".mkv", ".mp4", ".m4v", ".mov", ".avi", ".ts", ".m2ts", ".wmv")
 FIXERS = {".mkv": "fix_mkv_audio.sh", ".mp4": "fix_mp4_interleave.sh",
           ".m4v": "fix_mp4_interleave.sh", ".mov": "fix_mp4_interleave.sh"}
 IDENTITY_EXIT = {0: "OK", 10: "MISMATCH", 20: "UNVERIFIABLE"}
+
+
+def is_missing_bazarr_record(detail):
+    return (
+        "Bazarr has no record for Radarr movie " in detail
+        or "Bazarr returned 0 series for Sonarr ID " in detail
+    )
 
 
 # ---------------------------------------------------------------- state --
@@ -336,8 +344,12 @@ def identity_stage(path, st, cfg, allow_audio, verbose=False, final_try=True):
         return result
     if result == "DOWNLOAD_FAILED":
         result = "ERROR"
-    errored = result == "ERROR"
-    if errored:
+    missing_bazarr_record = result == "ERROR" and is_missing_bazarr_record(detail)
+    errored = result == "ERROR" and not missing_bazarr_record
+    if missing_bazarr_record:
+        result = "UNVERIFIABLE"
+        detail = "Bazarr has no record for this import; no subtitle reference is available"
+    elif errored:
         entry["identity_attempts"] = entry.get("identity_attempts", 0) + 1
         log(f"identity check error on {path} (attempt {entry['identity_attempts']}): {detail}")
         result, detail = "UNVERIFIABLE", (

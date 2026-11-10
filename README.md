@@ -22,10 +22,13 @@ Docker image.
 - Optional identity checking can flag a file whose audio/transcript does not
   match its expected movie or episode. The example config leaves this check
   disabled (`identity.enabled: false`); enabling it requires a working
-  transcription endpoint and Bazarr reference configuration. Findings are
-  sent privately to the configured admin through Debugarr and, optionally,
-  Telegram for review. Mediacheck does not post to a Discord channel or
-  automatically replace a file based on an identity mismatch.
+  transcription endpoint and Bazarr reference configuration. Missing subtitle
+  references or Bazarr catalog entries are treated as unverifiable and logged
+  without alerting; the import is accepted. Actual audio/title mismatches and
+  identity-check errors that need attention are sent privately to the
+  configured admin through Debuggarr and, optionally, Telegram. Mediacheck does
+  not post to a Discord channel or automatically replace a file based on an
+  identity mismatch.
 - Checkrr full-library integrity scans are separate. The supplied Docker
   config leaves `checkrr.cron` empty, so a full scan must be started manually
   from the Checkrr UI or API. Setting a cron expression enables automatic
