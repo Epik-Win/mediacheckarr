@@ -314,6 +314,21 @@ def bazarr_throttled_providers(is_tv):
     return throttled
 
 
+def bazarr_throttled_providers_or_defer(is_tv):
+    try:
+        return bazarr_throttled_providers(is_tv)
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        if isinstance(exc, urllib.error.HTTPError) and exc.code not in RATE_LIMIT_HTTP_CODES:
+            raise
+        log(
+            "WARNING: BAZARR_PROVIDER_STATUS_UNAVAILABLE: couldn't verify "
+            f"subtitle-provider availability ({type(exc).__name__}: {exc}); "
+            "deferring this import check"
+        )
+        log("VERDICT: REFERENCE_RATE_LIMITED - Bazarr provider status unavailable")
+        sys.exit(REFERENCE_RATE_LIMITED_EXIT)
+
+
 def _is_true(value):
     return str(value).lower() in ("1", "true", "yes")
 
@@ -903,7 +918,7 @@ def verdict(kind, detail):
 
 def no_reference_verdict(no_reference_detail, is_tv):
     """Only "every source answered and none has a subtitle" is a true skip."""
-    throttled = bazarr_throttled_providers(is_tv)
+    throttled = bazarr_throttled_providers_or_defer(is_tv)
     limited = ReferenceSearch.rate_limited + [
         f"{name}: {reason} (retry {retry})" for name, reason, retry in throttled]
     if limited:
@@ -914,6 +929,7 @@ def no_reference_verdict(no_reference_detail, is_tv):
         log(f"VERDICT: REFERENCE_DOWNLOAD_FAILED - {ReferenceSearch.download_failures} "
             "subtitle(s) were listed but none could be downloaded")
         sys.exit(REFERENCE_DOWNLOAD_FAILED_EXIT)
+    log(f"WARNING: NO_SUBTITLE_REFERENCE: {no_reference_detail}")
     verdict("UNVERIFIABLE", no_reference_detail)
 
 
@@ -1065,7 +1081,7 @@ def verify_media_audio(media_path, identity):
         no_reference_verdict(no_reference_detail, identity["is_tv"])
     # References that couldn't be fetched because of a rate limit might have
     # matched: hold rather than report.
-    if ReferenceSearch.rate_limited or bazarr_throttled_providers(identity["is_tv"]):
+    if ReferenceSearch.rate_limited or bazarr_throttled_providers_or_defer(identity["is_tv"]):
         no_reference_verdict(no_reference_detail, identity["is_tv"])
     pct, matches, total = best
     verdict("MISMATCH", f"center audio does not sufficiently match any exact-title "

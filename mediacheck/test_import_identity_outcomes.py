@@ -78,7 +78,7 @@ class MissingBazarrReferenceTests(unittest.TestCase):
                 return_value=(
                     "UNVERIFIABLE",
                     "UNVERIFIABLE - no usable exact-episode English subtitle from any provider",
-                    "",
+                    "WARNING: NO_SUBTITLE_REFERENCE: no usable exact-episode English subtitle\n",
                 ),
             ),
             patch.object(mediacheck, "log"),
@@ -114,6 +114,37 @@ class MissingBazarrReferenceTests(unittest.TestCase):
         }}}
         output = (
             "WARNING: BAZARR_EPISODE_NOT_INDEXED: Bazarr has no episode record\n"
+            "VERDICT: UNVERIFIABLE - no usable exact-episode English subtitle\n"
+        )
+        with (
+            patch.object(
+                mediacheck, "run_identity",
+                return_value=("UNVERIFIABLE", "no usable exact-episode English subtitle", output),
+            ),
+            patch.object(mediacheck, "log"),
+            patch.object(mediacheck.mclib, "withdraw_identity_review") as withdraw,
+            patch.object(mediacheck, "flag_identity_review") as flag_review,
+        ):
+            result = mediacheck.identity_stage(
+                "/library/example.mkv", state, {}, True,
+            )
+        entry = state["files"]["/library/example.mkv"]
+        self.assertEqual(result, "UNVERIFIABLE")
+        self.assertNotIn("review", entry)
+        self.assertNotIn("identity_review_id", entry)
+        self.assertNotIn("identity_attempts", entry)
+        withdraw.assert_called_once()
+        flag_review.assert_not_called()
+
+    def test_no_subtitle_reference_withdraws_stale_review(self):
+        state = {"files": {"/library/example.mkv": {
+            "identity_review_id": "MC-87654321",
+            "identity_review_notified": True,
+            "identity_attempts": 1,
+            "review": "old DNS failure",
+        }}}
+        output = (
+            "WARNING: NO_SUBTITLE_REFERENCE: no usable exact-episode English subtitle\n"
             "VERDICT: UNVERIFIABLE - no usable exact-episode English subtitle\n"
         )
         with (

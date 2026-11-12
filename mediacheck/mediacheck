@@ -352,10 +352,12 @@ def identity_stage(path, st, cfg, allow_audio, verbose=False, final_try=True):
         (result == "ERROR" and is_missing_bazarr_record(detail))
         or "WARNING: BAZARR_EPISODE_NOT_INDEXED:" in out
     )
+    no_subtitle_reference = "WARNING: NO_SUBTITLE_REFERENCE:" in out
     errored = result == "ERROR" and not missing_bazarr_record
-    if missing_bazarr_record:
+    if missing_bazarr_record or no_subtitle_reference:
         result = "UNVERIFIABLE"
-        detail = "Bazarr has no record for this import; no subtitle reference is available"
+        if missing_bazarr_record:
+            detail = "Bazarr has no record for this import; no subtitle reference is available"
         entry.pop("identity_attempts", None)
     elif errored:
         entry["identity_attempts"] = entry.get("identity_attempts", 0) + 1
@@ -373,15 +375,27 @@ def identity_stage(path, st, cfg, allow_audio, verbose=False, final_try=True):
     if evidence:
         entry["identity"]["evidence"] = evidence
     log(f"IDENTITY {result} {path}: {detail}")
-    if missing_bazarr_record:
-        log(f"IMPORT ACCEPTED {path}: Bazarr has no subtitle index for this episode")
+    if missing_bazarr_record or no_subtitle_reference:
+        accepted_reason = (
+            "Bazarr has no subtitle index for this episode"
+            if missing_bazarr_record
+            else "no independent subtitle reference is available"
+        )
+        log(f"IMPORT ACCEPTED {path}: {accepted_reason}")
         review_id = entry.get("identity_review_id")
         if review_id:
+            withdrawal_reason = (
+                "Withdrawn: no independent subtitle reference was available; "
+                "the Sonarr/Radarr import is accepted."
+            )
+            if missing_bazarr_record:
+                withdrawal_reason = (
+                    "Withdrawn: Bazarr has no episode record to search for subtitles; "
+                    "the Sonarr import is accepted."
+                )
             try:
                 mclib.withdraw_identity_review(
-                    cfg, review_id,
-                    "Withdrawn: Bazarr has no episode record to search for subtitles; "
-                    "the Sonarr import is accepted.",
+                    cfg, review_id, withdrawal_reason,
                 )
             except Exception as exc:
                 log(f"could not withdraw stale Debuggarr review {review_id}: "

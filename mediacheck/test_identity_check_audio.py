@@ -265,10 +265,24 @@ class MissingBazarrEpisodeTests(unittest.TestCase):
             patch.object(identity_check, "bazarr_throttled_providers", return_value=[]),
             patch.object(identity_check.ReferenceSearch, "rate_limited", []),
             patch.object(identity_check.ReferenceSearch, "download_failures", 0),
+            patch.object(identity_check, "log"),
         ):
             with self.assertRaises(SystemExit) as result:
                 identity_check.no_reference_verdict("no usable subtitle", is_tv=True)
         self.assertEqual(result.exception.code, identity_check.EXIT_CODES["UNVERIFIABLE"])
+
+    def test_provider_status_dns_failure_defers_without_error(self):
+        error = urllib.error.URLError(
+            OSError(-2, "Name or service not known"),
+        )
+        with (
+            patch.object(identity_check, "bazarr_throttled_providers", side_effect=error),
+            patch.object(identity_check, "log") as log,
+        ):
+            with self.assertRaises(SystemExit) as result:
+                identity_check.no_reference_verdict("no usable subtitle", is_tv=True)
+        self.assertEqual(result.exception.code, identity_check.REFERENCE_RATE_LIMITED_EXIT)
+        self.assertIn("BAZARR_PROVIDER_STATUS_UNAVAILABLE", log.call_args_list[0].args[0])
 
 
 if __name__ == "__main__":
